@@ -92,7 +92,7 @@ def _cached_install_inspection(
     with _INSTALL_INSPECT_CACHE_LOCK:
         cached = _INSTALL_INSPECT_CACHE.get(key)
         if cached is not None and now - cached[0] < _INSTALL_INSPECT_CACHE_TTL_SECONDS:
-            return copy.deepcopy(cached[1])
+            return dict(cached[1])
     value = factory()
     payload = copy.deepcopy(value if isinstance(value, dict) else {})
     with _INSTALL_INSPECT_CACHE_LOCK:
@@ -100,7 +100,7 @@ def _cached_install_inspection(
         if len(_INSTALL_INSPECT_CACHE) > 32:
             for stale_key in list(_INSTALL_INSPECT_CACHE)[:-32]:
                 _INSTALL_INSPECT_CACHE.pop(stale_key, None)
-    return copy.deepcopy(payload)
+    return dict(payload)
 
 
 def clear_install_inspection_cache() -> None:
@@ -665,6 +665,9 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             _default_memory_reader_enabled(),
         ),
         memory_reader_textractor_path=str(memory_reader_obj.get("textractor_path") or ""),
+        memory_reader_textractor_proxy=str(
+            memory_reader_obj.get("textractor_proxy") or ""
+        ).strip(),
         memory_reader_install_release_api_url=str(
             memory_reader_obj.get("install_release_api_url")
             or DEFAULT_TEXTRACTOR_RELEASE_API_URL
@@ -673,7 +676,7 @@ def build_config(raw_config: dict[str, Any]) -> GalgameConfig:
             memory_reader_obj.get("install_target_dir") or ""
         ).strip(),
         memory_reader_install_timeout_seconds=_coerce_float(
-            memory_reader_obj.get("install_timeout_seconds"), 180.0, minimum=1.0
+            memory_reader_obj.get("install_timeout_seconds"), 300.0, minimum=1.0
         ),
         memory_reader_auto_detect=bool(memory_reader_obj.get("auto_detect", True)),
         memory_reader_hook_codes=_coerce_string_list(
