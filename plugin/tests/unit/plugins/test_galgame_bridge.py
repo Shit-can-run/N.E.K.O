@@ -515,7 +515,12 @@ def test_persist_context_snapshot_allows_missing_game_id_when_not_required() -> 
         context_persist_enabled=True,
         context_persist_require_game_id=False,
     )
-    plugin._state = SimpleNamespace(active_game_id="", context_snapshot={})
+    plugin._state = SimpleNamespace(
+        active_game_id="",
+        active_session_id="",
+        latest_snapshot={"scene_id": "scene-a", "route_id": ""},
+        context_snapshot={},
+    )
     plugin._state_lock = threading.Lock()
     plugin._state_dirty = False
     plugin._cached_snapshot = {"stale": True}
@@ -537,6 +542,63 @@ def test_persist_context_snapshot_allows_missing_game_id_when_not_required() -> 
     assert plugin._state.context_snapshot["summary_seed"] == "summary without game id"
     assert plugin._state_dirty is True
     assert plugin._cached_snapshot is None
+
+
+def test_persist_context_snapshot_skips_write_when_session_turns_stale() -> None:
+    saved: list[dict[str, object]] = []
+
+    class _Persist:
+        def persist_context_snapshot(self, snapshot: dict[str, object]) -> None:
+            saved.append(dict(snapshot))
+
+    class _Logger:
+        def warning(self, *_: object, **__: object) -> None:
+            return None
+
+    plugin = GalgameBridgePlugin.__new__(GalgameBridgePlugin)
+    plugin._cfg = SimpleNamespace(
+        context_persist_enabled=True,
+        context_persist_require_game_id=True,
+    )
+    plugin._state = SimpleNamespace(
+        active_game_id="demo.alpha",
+        active_session_id="sess-a",
+        latest_snapshot={"scene_id": "scene-a", "route_id": "route-a"},
+        context_snapshot={},
+    )
+    plugin._state_lock = threading.Lock()
+    plugin._state_dirty = False
+    plugin._cached_snapshot = {"stale": True}
+    plugin._persist = _Persist()
+    plugin.logger = _Logger()
+
+    checks = 0
+    original_liveness = plugin._context_snapshot_liveness_matches
+
+    def _flip_session_after_first_check(**kwargs: object) -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            plugin._state.active_session_id = "sess-b"
+        return original_liveness(**kwargs)  # type: ignore[arg-type]
+
+    plugin._context_snapshot_liveness_matches = _flip_session_after_first_check  # type: ignore[method-assign]
+
+    plugin._persist_context_snapshot_from_summary(
+        {
+            "game_id": "demo.alpha",
+            "session_id": "sess-a",
+            "scene_id": "scene-a",
+            "route_id": "route-a",
+            "stable_lines": [{"line_id": "line-1"}],
+        },
+        {"summary": "stale during write"},
+    )
+
+    assert checks == 2
+    assert saved == []
+    assert plugin._state.context_snapshot == {}
+    assert plugin._state_dirty is False
 
 
 @pytest.mark.asyncio
@@ -6993,13 +7055,13 @@ async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_su
             session_id=session_id,
             last_seq=2,
             state=_session_state(
-                speaker="é›ªä¹ƒ",
-                text="è¿™æ˜¯ OCR è¯»å–æ¥çš„å°è¯ã€‚",
+                speaker="雪乃",
+                text="这是 OCR 读取来的台词。",
                 scene_id="ocr:scene-a",
                 line_id="ocr:line-1",
                 choices=[
-                    {"choice_id": "ocr:line-1#choice0", "text": "åŽ»æ•™å®¤", "index": 0, "enabled": True},
-                    {"choice_id": "ocr:line-1#choice1", "text": "åŽ»å¤©å°", "index": 1, "enabled": True},
+                    {"choice_id": "ocr:line-1#choice0", "text": "去教室", "index": 0, "enabled": True},
+                    {"choice_id": "ocr:line-1#choice1", "text": "去天台", "index": 1, "enabled": True},
                 ],
                 is_menu_open=True,
                 ts="2026-04-21T08:31:00Z",
@@ -7012,8 +7074,8 @@ async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_su
                 session_id=session_id,
                 game_id=game_id,
                 payload={
-                    "speaker": "é›ªä¹ƒ",
-                    "text": "è¿™æ˜¯ OCR è¯»å–æ¥çš„å°è¯ã€‚",
+                    "speaker": "雪乃",
+                    "text": "这是 OCR 读取来的台词。",
                     "line_id": "ocr:line-1",
                     "scene_id": "ocr:scene-a",
                     "route_id": "",
@@ -7030,8 +7092,8 @@ async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_su
                     "scene_id": "ocr:scene-a",
                     "route_id": "",
                     "choices": [
-                        {"choice_id": "ocr:line-1#choice0", "text": "åŽ»æ•™å®¤", "index": 0, "enabled": True},
-                        {"choice_id": "ocr:line-1#choice1", "text": "åŽ»å¤©å°", "index": 1, "enabled": True},
+                        {"choice_id": "ocr:line-1#choice0", "text": "去教室", "index": 0, "enabled": True},
+                        {"choice_id": "ocr:line-1#choice1", "text": "去天台", "index": 1, "enabled": True},
                     ],
                 },
                 ts="2026-04-21T08:31:01Z",
@@ -7052,11 +7114,11 @@ async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_su
         params = kwargs.get("params") or {}
         operation = params.get("operation")
         if operation == "explain_line":
-            return {"explanation": "è¿™æ˜¯å¯¹ OCR å°è¯çš„è§£é‡Šã€‚", "evidence": []}
+            return {"explanation": "这是对 OCR 台词的解释。", "evidence": []}
         if operation == "summarize_scene":
             return {
-                "summary": "è¿™æ˜¯å¯¹ OCR åœºæ™¯çš„æ€»ç»“ã€‚",
-                "key_points": [{"type": "plot", "text": "OCR ä¸»çº¿å¯ç”¨ã€‚"}],
+                "summary": "这是对 OCR 场景的总结。",
+                "key_points": [{"type": "plot", "text": "OCR 主线可用。"}],
             }
         if operation == "suggest_choice":
             context = params.get("context") or {}
@@ -7067,7 +7129,7 @@ async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_su
                         "choice_id": visible_choices[0]["choice_id"],
                         "text": visible_choices[0]["text"],
                         "rank": 1,
-                        "reason": "OCR ä¸‹ä¼˜å…ˆç»§ç»­ä¸»çº¿ã€‚",
+                        "reason": "OCR 下优先继续主线。",
                     }
                 ]
             }
@@ -7117,7 +7179,7 @@ async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_su
     assert explain.value["semantic_degraded"] is True
     assert explain.value["fallback_used"] is False
     assert "ocr_reader_input" in explain.value["diagnostic"]
-    assert explain.value["explanation"] == "è¿™æ˜¯å¯¹ OCR å°è¯çš„è§£é‡Šã€‚"
+    assert explain.value["explanation"] == "这是对 OCR 台词的解释。"
 
     assert isinstance(summarize, Ok)
     assert summarize.value["degraded"] is True
@@ -7125,7 +7187,7 @@ async def test_phase2_entries_mark_ocr_reader_input_as_degraded_even_when_llm_su
     assert summarize.value["semantic_degraded"] is True
     assert summarize.value["fallback_used"] is False
     assert "ocr_reader_input" in summarize.value["diagnostic"]
-    assert summarize.value["summary"] == "è¿™æ˜¯å¯¹ OCR åœºæ™¯çš„æ€»ç»“ã€‚"
+    assert summarize.value["summary"] == "这是对 OCR 场景的总结。"
 
     assert isinstance(suggest, Ok)
     assert suggest.value["degraded"] is True
@@ -8734,10 +8796,16 @@ def test_game_llm_agent_reply_context_uses_dynamic_window_config(tmp_path: Path)
     context = agent._build_agent_reply_context(shared, prompt="status")
     public_context = context["public_context"]
 
-    assert public_context["stable_lines"] == []
-    assert [line["line_id"] for line in public_context["observed_lines"]] == ["o3", "o4", "o5"]
-    assert [line["line_id"] for line in public_context["recent_lines"]] == ["o3", "o4", "o5"]
-    assert len(public_context["recent_lines"]) == 3
+    assert [line["line_id"] for line in public_context["stable_lines"]] == [
+        f"s{index}" for index in range(6)
+    ]
+    assert [line["line_id"] for line in public_context["observed_lines"]] == [
+        f"o{index}" for index in range(6)
+    ]
+    assert [line["line_id"] for line in public_context["recent_lines"]] == [
+        *[f"s{index}" for index in range(6)],
+        *[f"o{index}" for index in range(6)],
+    ]
 
 
 @pytest.mark.plugin_unit
@@ -8968,6 +9036,58 @@ def test_game_llm_agent_reply_context_choices_follow_recent_line_window(
         "c-observed",
         "c-stable",
     ]
+
+
+@pytest.mark.plugin_unit
+def test_game_llm_agent_reply_context_keeps_condensed_count_for_internal_line_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    monkeypatch.setattr(
+        game_llm_agent_module,
+        "_compute_dynamic_line_limit",
+        lambda *args, **kwargs: 2,
+    )
+    shared = _shared_state(
+        snapshot=_session_state(scene_id="scene-a", line_id="line-current"),
+        history_lines=[
+            {
+                "speaker": "雪乃",
+                "text": "第一句\n第二句\n第三句",
+                "line_id": "s1",
+                "scene_id": "scene-a",
+                "_condensed_line_ids": ["s1", "s2", "s3"],
+                "_condensed_count": 3,
+            }
+        ],
+        history_observed_lines=[
+            {
+                "speaker": "雪乃",
+                "text": "候选一句\n候选二句",
+                "line_id": "o1",
+                "scene_id": "scene-a",
+                "_condensed_line_ids": ["o1", "o2"],
+                "_condensed_count": 2,
+            }
+        ],
+    )
+
+    public_context = agent._build_agent_reply_context(shared, prompt="status")["public_context"]
+
+    assert public_context["stable_lines"][0]["_condensed_count"] == 3
+    assert public_context["observed_lines"][0]["_condensed_count"] == 2
+    assert game_llm_agent_module._context_line_count(public_context["stable_lines"]) == 3
+    assert all("_condensed_count" not in line for line in public_context["recent_lines"])
+    assert all("_condensed_line_ids" not in line for line in public_context["recent_lines"])
 
 
 @pytest.mark.plugin_unit
@@ -11086,6 +11206,76 @@ async def test_game_llm_agent_pushes_scene_summary_after_eight_lines(
 
 @pytest.mark.asyncio
 @pytest.mark.plugin_unit
+async def test_game_llm_agent_scene_summary_counts_condensed_stable_lines(
+    tmp_path: Path,
+) -> None:
+    plugin_dir, bridge_root = _make_plugin_dirs(tmp_path)
+    ctx = _Ctx(plugin_dir, _make_effective_config(bridge_root))
+    plugin = GalgameBridgePlugin(ctx)
+    agent = GameLLMAgent(
+        plugin=plugin,
+        logger=_Logger(),
+        llm_gateway=_FakeLLMGateway(),
+        host_adapter=_FakeHostAdapter(),
+    )
+    shared = _shared_state(
+        mode="companion",
+        snapshot=_session_state(
+            speaker="雪乃",
+            text="第 8 句台词。",
+            scene_id="scene-a",
+            line_id="line-8",
+            ts="2026-04-21T08:33:08Z",
+        ),
+    )
+    agent._runtime_loop = asyncio.get_running_loop()
+    agent._op_lock = asyncio.Lock()
+    agent._observed_session_id = str(shared["active_session_id"])
+    agent._observed_scene_id = "scene-a"
+    agent._schedule_scene_summary_task(
+        shared=shared,
+        session_id=str(shared["active_session_id"]),
+        scene_id="scene-a",
+        route_id="",
+        snapshot=dict(shared["latest_snapshot"]),
+        context={
+            "scene_id": "scene-a",
+            "route_id": "",
+            "stable_lines": [
+                {
+                    "line_id": "line-1",
+                    "speaker": "雪乃",
+                    "text": "\n".join(f"第 {index} 句台词。" for index in range(1, 9)),
+                    "scene_id": "scene-a",
+                    "route_id": "",
+                    "ts": "2026-04-21T08:33:08Z",
+                    "_condensed_line_ids": [f"line-{index}" for index in range(1, 9)],
+                    "_condensed_count": 8,
+                }
+            ],
+            "observed_lines": [],
+            "recent_choices": [],
+        },
+        trigger="line_count",
+        metadata={
+            "context_type": "galgame_scene_context",
+            "trigger": "line_count",
+            "scheduled_from_event_seq": 0,
+            "last_line_seq": 0,
+        },
+        update_scene_memory=False,
+        scheduled_line_count=8,
+    )
+    await _drain_agent_summary_tasks(agent)
+
+    assert ctx.pushed_messages[-1]["metadata"]["kind"] == "scene_summary"
+    assert ctx.pushed_messages[-1]["metadata"]["trigger"] == "line_count"
+    assert ctx.pushed_messages[-1]["metadata"]["stable_line_count"] == 8
+    assert ctx.pushed_messages[-1]["metadata"]["summary_delivery_key"] == "scene-a:0:8"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plugin_unit
 async def test_game_llm_agent_delivers_line_count_summary_after_scene_change(
     tmp_path: Path,
 ) -> None:
@@ -11102,8 +11292,8 @@ async def test_game_llm_agent_delivers_line_count_summary_after_scene_change(
     lines = [
         {
             "line_id": f"line-{index}",
-            "speaker": "é›ªä¹ƒ",
-            "text": f"ç¬¬ {index} å¥å°è¯ã€‚",
+            "speaker": "雪乃",
+            "text": f"第 {index} 句台词。",
             "scene_id": "scene-a",
             "route_id": "",
             "ts": f"2026-04-21T08:33:{index:02d}Z",
@@ -11113,8 +11303,8 @@ async def test_game_llm_agent_delivers_line_count_summary_after_scene_change(
     shared_scene_a = _shared_state(
         mode="companion",
         snapshot=_session_state(
-            speaker="é›ªä¹ƒ",
-            text="ç¬¬ 8 å¥å°è¯ã€‚",
+            speaker="雪乃",
+            text="第 8 句台词。",
             scene_id="scene-a",
             line_id="line-8",
             ts="2026-04-21T08:33:08Z",
@@ -11125,8 +11315,8 @@ async def test_game_llm_agent_delivers_line_count_summary_after_scene_change(
         mode="companion",
         push_notifications=False,
         snapshot=_session_state(
-            speaker="é›ªä¹ƒ",
-            text="ä¸‹ä¸€å¹•ã€‚",
+            speaker="雪乃",
+            text="下一幕。",
             scene_id="scene-b",
             line_id="line-9",
             ts="2026-04-21T08:34:00Z",
@@ -11134,8 +11324,8 @@ async def test_game_llm_agent_delivers_line_count_summary_after_scene_change(
         history_lines=[
             {
                 "line_id": "line-9",
-                "speaker": "é›ªä¹ƒ",
-                "text": "ä¸‹ä¸€å¹•ã€‚",
+                "speaker": "雪乃",
+                "text": "下一幕。",
                 "scene_id": "scene-b",
                 "route_id": "",
                 "ts": "2026-04-21T08:34:00Z",
