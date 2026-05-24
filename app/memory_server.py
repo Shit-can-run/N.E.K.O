@@ -2842,6 +2842,66 @@ async def _periodic_reflection_synthesis_loop():
         await asyncio.sleep(interval)
 
 
+async def _bootstrap_embedding_worker() -> None:
+    """ready 后在后台 bootstrap 向量预热 / 去重 worker。
+
+    重 import（``memory.embedding_worker`` 拉起 embedding 栈 ~0.6s）和服务构造
+    （``get_embedding_service()`` 可能 probe/load 模型）全程在 ``to_thread`` 里跑，
+    不阻塞 event loop；``start()`` 是轻量的（只 ``create_task``），回到 loop 上调。
+    worker 自带 warmup 延迟、向量不可用也会降级，所以从 memory 启动关键路径移出来
+    对 greeting 零影响。
+
+    ⚠️ 故意**不**把 manager 作为参数传入：worker 的 getter（``lambda: persona_manager``
+    等）必须解析到模块全局，这样 /reload 重绑全局后下一轮 sweep 能看到新实例。
+    传参会让闭包捕获启动期的旧实例，绕过 worker 设计的 reload-staleness 防护。
+    """
+    global embedding_warmup_worker, fact_dedup_resolver
+    try:
+        def _build():
+            from memory.embedding_worker import EmbeddingWarmupWorker
+            from memory.fact_dedup import FactDedupResolver
+            from config import VECTORS_WARMUP_DELAY_SECONDS
+
+            def _current_catgirl_names() -> list[str]:
+                try:
+                    data = _config_manager.load_characters()
+                    return list((data or {}).get('猫娘', {}).keys())
+                except Exception:
+                    return []
+
+            bound_fact_store = fact_store
+            resolver = FactDedupResolver(bound_fact_store)
+            worker = EmbeddingWarmupWorker(
+                get_persona_manager=lambda: persona_manager,
+                get_reflection_engine=lambda: reflection_engine,
+                get_fact_store=lambda: fact_store,
+                get_character_names=_current_catgirl_names,
+                warmup_delay_seconds=VECTORS_WARMUP_DELAY_SECONDS,
+                get_dedup_resolver=lambda: fact_dedup_resolver,
+            )
+            return worker, resolver, bound_fact_store
+
+        worker, resolver, bound_fact_store = await asyncio.to_thread(_build)
+        # worker 用 getter 读全局，天然 reload-safe，直接发布。
+        embedding_warmup_worker = worker
+        # 但 resolver 是绑定到具体 fact_store 的实例：若 await（重 import + 构造）期间
+        # reload_memory_components() 换了 fact_store 并重绑了 fact_dedup_resolver，
+        # 这里再无条件赋值会用绑旧 store 的 resolver 覆盖掉 reload 的新 resolver，
+        # 导致 worker 的 get_fact_store 读新 store、get_dedup_resolver 读旧 resolver 错配。
+        # 因此只在当前全局 fact_store 仍是 resolver 绑定的那个时才发布。
+        if fact_store is bound_fact_store:
+            fact_dedup_resolver = resolver
+        else:
+            logger.info("[Memory] embedding worker bootstrap 与 reload 竞争，沿用 reload 已重绑的 fact_dedup_resolver")
+        embedding_warmup_worker.start()
+    except Exception as e:
+        logger.warning(f"[Memory] embedding worker bootstrap failed: {e}")
+        embedding_warmup_worker = None
+        # 不清 fact_dedup_resolver：若 await 期间 reload 已重绑了一个绑定新 store 的
+        # resolver，这里清成 None 会把 reload 的成果抹掉。bootstrap 失败本就只代表
+        # "没有 warmup worker"，resolver 该保留（None 维持原样，reload 设的则保留）。
+
+
 async def ensure_memory_server_runtime_initialized(*, reason: str = "") -> bool:
     global recent_history_manager, settings_manager, time_manager, fact_store
     global persona_manager, reflection_engine, cursor_store, outbox, event_log, reconciler
@@ -2988,35 +3048,12 @@ async def ensure_memory_server_runtime_initialized(*, reason: str = "") -> bool:
             _memory_background_tasks_started = True
 
         # memory-enhancements P2: vector embedding warmup + backfill worker.
-        # The worker is optional; startup should continue if vectors are
-        # unavailable or its bootstrap fails.
-        try:
-            from memory.embedding_worker import EmbeddingWarmupWorker
-            from memory.fact_dedup import FactDedupResolver
-            from config import VECTORS_WARMUP_DELAY_SECONDS
-
-            def _current_catgirl_names() -> list[str]:
-                try:
-                    data = _config_manager.load_characters()
-                    return list((data or {}).get('猫娘', {}).keys())
-                except Exception:
-                    return list(catgirl_names)
-
-            fact_dedup_resolver = FactDedupResolver(fact_store)
-
-            embedding_warmup_worker = EmbeddingWarmupWorker(
-                get_persona_manager=lambda: persona_manager,
-                get_reflection_engine=lambda: reflection_engine,
-                get_fact_store=lambda: fact_store,
-                get_character_names=_current_catgirl_names,
-                warmup_delay_seconds=VECTORS_WARMUP_DELAY_SECONDS,
-                get_dedup_resolver=lambda: fact_dedup_resolver,
-            )
-            embedding_warmup_worker.start()
-        except Exception as e:
-            logger.warning(f"[Memory] embedding worker bootstrap failed: {e}")
-            embedding_warmup_worker = None
-            fact_dedup_resolver = None
+        # 这块的 import（embedding 栈 ~0.6s）+ 服务构造原本同步跑在 startup
+        # handler 里，uvicorn 要等 handler 返回才开端口，于是把 memory 端口
+        # 就绪足足推后 ~1.3s（合并单进程下又被串行放大）。worker 本身是可选的、
+        # 自带 warmup 延迟，greeting 不依赖向量——所以挪到后台 task，重活全程
+        # 在 to_thread 里跑，绝不阻塞 event loop / 拖慢端口就绪。
+        _spawn_background_task(_bootstrap_embedding_worker())
 
         _memory_runtime_init_completed = True
         logger.info("[Memory] 运行态初始化完成 (reason=%s)", reason or "manual")
